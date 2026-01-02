@@ -1,39 +1,36 @@
 import os
 import uuid
-import secrets
+from typing import Optional
 
-from fastapi import FastAPI, Request, Depends, Header, HTTPException
+from fastapi import FastAPI, Request, Header, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
+# Azure OpenAI SDK (OpenAI Python client)
+from openai import AzureOpenAI
+
 app = FastAPI(title="genai-agent-gateway")
 
+# Toggles
 MOCK_LLM = os.getenv("MOCK_LLM", "true").lower() == "true"
 
-# If API_KEY is set (recommended in Azure), /api/chat requires header: x-api-key: <value>
-API_KEY = os.getenv("API_KEY")
+# Optional gateway API key (if set, requests must include x-api-key header)
+GATEWAY_API_KEY = os.getenv("GATEWAY_API_KEY", "").strip()
+
+# Azure OpenAI config
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "").strip()  # e.g. https://aoai-gateway-shanky-01.openai.azure.com
+AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY", "").strip()
+AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview").strip()
+AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "").strip()  # e.g. gateway-chat
 
 
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
 
 
-def require_api_key(x_api_key: str | None = Header(default=None, alias="x-api-key")):
-    """
-    Minimal auth gate:
-    - If API_KEY is NOT set -> allow (dev convenience)
-    - If API_KEY is set -> require matching x-api-key header
-    """
-    if not API_KEY:
-        return
-    if (not x_api_key) or (not secrets.compare_digest(x_api_key, API_KEY)):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-
 @app.middleware("http")
 async def add_request_id(request: Request, call_next):
     rid = request.headers.get("x-request-id") or str(uuid.uuid4())
-    request.state.request_id = rid
     response = await call_next(request)
     response.headers["x-request-id"] = rid
     return response
@@ -46,14 +43,42 @@ def home():
 
 @app.get("/healthz")
 def healthz():
-    return {"ok": True}
+    return {
+        "ok": True,
+        "mock_llm": MOCK_LLM,
+        "has_gateway_api_key": bool(GATEWAY_API_KEY),
+        "has_azure_openai_endpoint": bool(AZURE_OPENAI_ENDPOINT),
+        "has_azure_openai_key": bool(AZURE_OPENAI_API_KEY),
+        "has_azure_openai_deployment": bool(AZURE_OPENAI_DEPLOYMENT),
+        "azure_openai_api_version": AZURE_OPENAI_API_VERSION,
+    }
+
+
+def _enforce_gateway_key(x_api_key: Optional[str]):
+    if not GATEWAY_API_KEY:
+        return
+    if not x_api_key or x_api_key.strip() != GATEWAY_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing x-api-key")
+
+
+def _build_client() -> AzureOpenAI:
+    if not AZURE_OPENAI_ENDPOINT or not AZURE_OPENAI_API_KEY:
+        raise RuntimeError("Azure OpenAI endpoint/key missing. Set AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_API_KEY.")
+    return AzureOpenAI(
+        azure_endpoint=AZURE_OPENAI_ENDPOINT,
+        api_key=AZURE_OPENAI_API_KEY,
+        api_version=AZURE_OPENAI_API_VERSION,
+    )
 
 
 @app.post("/api/chat")
-def chat(req: ChatRequest, request: Request, _: None = Depends(require_api_key)):
-    request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
+def chat(req: ChatRequest, x_api_key: Optional[str] = Header(default=None, alias="x-api-key")):
+    request_id = str(uuid.uuid4())
 
-    # This is NOT real security. It's just a small guardrail to avoid responding to obvious credential exfiltration prompts.
+    # Optional gateway auth
+    _enforce_gateway_key(x_api_key)
+
+    # Very basic “bank-ish” safety: refuse obvious credential/bypass asks
     lower = req.message.lower()
     if any(x in lower for x in ["api key", "client secret", "password", "token", "system prompt", "bypass"]):
         return {
@@ -64,8 +89,24 @@ def chat(req: ChatRequest, request: Request, _: None = Depends(require_api_key))
 
     if MOCK_LLM:
         answer = f"[MOCK] Received: {req.message[:300]}"
-    else:
-        # We’ll wire Azure OpenAI later. For now keep the shape stable.
-        answer = "LLM mode not wired yet. Set MOCK_LLM=true."
+        return {"request_id": request_id, "answer": answer, "mock_llm": True}
 
-    return {"request_id": request_id, "answer": answer, "mock_llm": MOCK_LLM}
+    # Real Azure OpenAI call
+    if not AZURE_OPENAI_DEPLOYMENT:
+        raise HTTPException(status_code=500, detail="AZURE_OPENAI_DEPLOYMENT is not set (e.g., gateway-chat).")
+
+    try:
+        client = _build_client()
+        resp = client.chat.completions.create(
+            model=AZURE_OPENAI_DEPLOYMENT,  # IMPORTANT: this is the DEPLOYMENT NAME, not the base model name
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": req.message},
+            ],
+            temperature=0.2,
+            max_tokens=600,
+        )
+        answer = (resp.choices[0].message.content or "").strip()
+        return {"request_id": request_id, "answer": answer, "mock_llm": False}
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Azure OpenAI call failed: {type(e).__name__}: {e}")
