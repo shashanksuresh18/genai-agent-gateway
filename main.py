@@ -1,33 +1,36 @@
 import os
-import json
 import uuid
-import urllib.request
-import urllib.error
-from typing import Optional
+import json
+from urllib.parse import urlencode
+from urllib.request import Request as UrlRequest, urlopen
+from urllib.error import HTTPError, URLError
 
 from fastapi import FastAPI, Request, Header, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-app = FastAPI(title="genai-agent-gateway")
+app = FastAPI(title="genai-agent-gateway", version="0.2.0")
 
-# --- Feature flags / gateway auth ---
+# -----------------------------
+# Feature flags / gateway auth
+# -----------------------------
 MOCK_LLM = os.getenv("MOCK_LLM", "true").lower() == "true"
-GATEWAY_API_KEY = os.getenv("GATEWAY_API_KEY", "").strip()  # optional
+GATEWAY_API_KEY = os.getenv("GATEWAY_API_KEY", "").strip()
 
-# --- Azure OpenAI config (from Container App env vars) ---
+# -----------------------------
+# Azure OpenAI config (from env)
+# -----------------------------
 AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "").strip().rstrip("/")
 AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY", "").strip()
 AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview").strip()
 AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "").strip()
 
-# Optional tuning
-AOAI_TEMPERATURE = float(os.getenv("AOAI_TEMPERATURE", "0.2"))
-AOAI_MAX_OUTPUT_TOKENS = int(os.getenv("AOAI_MAX_OUTPUT_TOKENS", "300"))
+# Keep output small for demos/tests
+MAX_COMPLETION_TOKENS = int(os.getenv("MAX_COMPLETION_TOKENS", "256"))
 
 SYSTEM_PROMPT = os.getenv(
     "SYSTEM_PROMPT",
-    "You are a helpful assistant. Be concise and safe. Do not reveal secrets.",
+    "You are a helpful assistant. Keep answers concise and safe.",
 ).strip()
 
 
@@ -43,46 +46,34 @@ async def add_request_id(request: Request, call_next):
     return response
 
 
-def _require_gateway_key(x_api_key: Optional[str]):
-    # Only enforce if you actually configured a gateway key
-    if not GATEWAY_API_KEY:
-        return
-    if not x_api_key or x_api_key != GATEWAY_API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid or missing x-api-key")
+def _require_gateway_key(x_api_key: str | None):
+    # If you set GATEWAY_API_KEY, then enforce it.
+    if GATEWAY_API_KEY and x_api_key != GATEWAY_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized: invalid x-api-key")
 
 
-def _aoai_url() -> str:
-    if not AZURE_OPENAI_ENDPOINT or not AZURE_OPENAI_DEPLOYMENT:
-        return ""
-    return (
-        f"{AZURE_OPENAI_ENDPOINT}/openai/deployments/"
-        f"{AZURE_OPENAI_DEPLOYMENT}/chat/completions"
-        f"?api-version={AZURE_OPENAI_API_VERSION}"
-    )
-
-
-def _call_aoai(messages, request_id: str) -> str:
-    """
-    Calls Azure OpenAI Chat Completions via REST.
-    Handles the 'max_tokens' vs 'max_completion_tokens' mismatch by retrying.
-    """
+def _azure_openai_chat(user_message: str, request_id: str) -> str:
+    # Basic config checks
     if not AZURE_OPENAI_ENDPOINT or not AZURE_OPENAI_API_KEY or not AZURE_OPENAI_DEPLOYMENT:
-        raise RuntimeError("Azure OpenAI is not configured (missing endpoint/key/deployment).")
+        raise HTTPException(
+            status_code=500,
+            detail="Azure OpenAI is not configured. Set AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, AZURE_OPENAI_DEPLOYMENT.",
+        )
 
-    url = _aoai_url()
+    # Azure OpenAI Chat Completions endpoint
+    base = f"{AZURE_OPENAI_ENDPOINT}/openai/deployments/{AZURE_OPENAI_DEPLOYMENT}/chat/completions"
+    url = f"{base}?{urlencode({'api-version': AZURE_OPENAI_API_VERSION})}"
 
-    base_payload = {
-        "messages": messages,
-        "temperature": AOAI_TEMPERATURE,
+    payload = {
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_message},
+        ],
+        # IMPORTANT for your model: use max_completion_tokens (not max_tokens)
+        "max_completion_tokens": MAX_COMPLETION_TOKENS,
+        # DO NOT send temperature — your model rejects non-default values.
+        # If you send it, Azure will throw "Unsupported value".
     }
-
-    # Try modern parameter first (your model demanded this)
-    payload_1 = dict(base_payload)
-    payload_1["max_completion_tokens"] = AOAI_MAX_OUTPUT_TOKENS
-
-    # Fallback for older models/APIs
-    payload_2 = dict(base_payload)
-    payload_2["max_tokens"] = AOAI_MAX_OUTPUT_TOKENS
 
     headers = {
         "Content-Type": "application/json",
@@ -90,33 +81,29 @@ def _call_aoai(messages, request_id: str) -> str:
         "x-ms-client-request-id": request_id,
     }
 
-    def do_request(payload: dict) -> dict:
-        data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            raw = resp.read().decode("utf-8")
-            return json.loads(raw)
+    data = json.dumps(payload).encode("utf-8")
+    req = UrlRequest(url, data=data, headers=headers, method="POST")
 
     try:
-        resp_json = do_request(payload_1)
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", errors="replace")
-        # If server complains about max_completion_tokens, retry with max_tokens
-        if "max_completion_tokens" in body and "Unrecognized" in body:
-            resp_json = do_request(payload_2)
-        # If server complains about max_tokens, retry with max_completion_tokens
-        elif "max_tokens" in body and "Unsupported parameter" in body:
-            resp_json = do_request(payload_1)
-        else:
-            raise RuntimeError(f"Azure OpenAI HTTP {e.code}: {body}") from None
+        with urlopen(req, timeout=30) as resp:
+            body = resp.read().decode("utf-8")
+            out = json.loads(body)
+    except HTTPError as e:
+        err_body = e.read().decode("utf-8") if e.fp else str(e)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Azure OpenAI HTTP {e.code}: {err_body}",
+        )
+    except URLError as e:
+        raise HTTPException(status_code=502, detail=f"Azure OpenAI connection error: {e.reason}")
     except Exception as e:
-        raise RuntimeError(f"Azure OpenAI call failed: {repr(e)}") from None
+        raise HTTPException(status_code=502, detail=f"Azure OpenAI unexpected error: {repr(e)}")
 
-    # Standard Chat Completions shape
+    # Parse response
     try:
-        return resp_json["choices"][0]["message"]["content"]
+        return out["choices"][0]["message"]["content"]
     except Exception:
-        raise RuntimeError(f"Unexpected Azure OpenAI response shape: {resp_json}") from None
+        raise HTTPException(status_code=502, detail=f"Azure OpenAI returned unexpected payload: {out}")
 
 
 @app.get("/")
@@ -138,12 +125,12 @@ def healthz():
 
 
 @app.post("/api/chat")
-def chat(req: ChatRequest, x_api_key: Optional[str] = Header(default=None, alias="x-api-key")):
+def chat(req: ChatRequest, x_api_key: str | None = Header(default=None, alias="x-api-key")):
     _require_gateway_key(x_api_key)
 
     request_id = str(uuid.uuid4())
 
-    # Simple safety: refuse obvious secret/bypass attempts
+    # simple safety filter
     lower = req.message.lower()
     if any(x in lower for x in ["api key", "client secret", "password", "token", "system prompt", "bypass"]):
         return {
@@ -156,14 +143,5 @@ def chat(req: ChatRequest, x_api_key: Optional[str] = Header(default=None, alias
         answer = f"[MOCK] Received: {req.message[:300]}"
         return {"request_id": request_id, "answer": answer, "mock_llm": True}
 
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": req.message},
-    ]
-
-    try:
-        answer = _call_aoai(messages, request_id=request_id)
-        return {"request_id": request_id, "answer": answer, "mock_llm": False}
-    except Exception as e:
-        # Keep it visible for debugging in Swagger, but don't dump secrets
-        raise HTTPException(status_code=502, detail=str(e))
+    answer = _azure_openai_chat(req.message, request_id)
+    return {"request_id": request_id, "answer": answer, "mock_llm": False}
