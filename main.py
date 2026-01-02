@@ -1,8 +1,10 @@
 import os
 import uuid
+import json
 from typing import Optional
+from urllib import request as urlrequest
+from urllib.error import HTTPError, URLError
 
-import requests
 from fastapi import FastAPI, Request, Header, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -12,11 +14,11 @@ app = FastAPI(title="genai-agent-gateway")
 # ===== Config =====
 MOCK_LLM = os.getenv("MOCK_LLM", "true").lower() == "true"
 
-# Gateway auth (your own API key to protect /api/chat)
+# Gateway auth (protect /api/chat)
 GATEWAY_API_KEY = os.getenv("GATEWAY_API_KEY", "").strip()
 
 # Azure OpenAI config
-AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "").strip()  # e.g. https://aoai-xxx.openai.azure.com
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT", "").strip()  # https://xxxx.openai.azure.com
 AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY", "").strip()
 AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview").strip()
 AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "").strip()  # e.g. gateway-chat
@@ -53,11 +55,24 @@ def healthz():
 
 
 def _require_gateway_key(x_api_key: Optional[str]) -> None:
-    # If you asked for auth, we enforce it. If key not configured, fail loudly.
     if not GATEWAY_API_KEY:
         raise HTTPException(status_code=500, detail="GATEWAY_API_KEY is not configured on the server.")
     if not x_api_key or x_api_key.strip() != GATEWAY_API_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized: missing or invalid x-api-key.")
+
+
+def _http_post_json(url: str, headers: dict, payload: dict, timeout: int = 30) -> dict:
+    data = json.dumps(payload).encode("utf-8")
+    req = urlrequest.Request(url, data=data, headers=headers, method="POST")
+    try:
+        with urlrequest.urlopen(req, timeout=timeout) as resp:
+            body = resp.read().decode("utf-8")
+            return json.loads(body)
+    except HTTPError as e:
+        err_body = e.read().decode("utf-8") if e.fp else str(e)
+        raise RuntimeError(f"Azure OpenAI HTTP {e.code}: {err_body}")
+    except URLError as e:
+        raise RuntimeError(f"Azure OpenAI network error: {e}")
 
 
 def _call_azure_openai(user_text: str) -> str:
@@ -75,47 +90,29 @@ def _call_azure_openai(user_text: str) -> str:
         "api-key": AZURE_OPENAI_API_KEY,
     }
 
-    # IMPORTANT:
-    # - Don't set temperature (your model complained when non-default was used)
-    # - Some models want max_completion_tokens instead of max_tokens, so we try both.
-    base_payload = {
+    # DO NOT set temperature (your model rejected non-default)
+    # DO NOT set max_tokens if model rejects it (we keep payload minimal)
+    payload = {
         "messages": [
             {"role": "system", "content": "You are a helpful assistant."},
             {"role": "user", "content": user_text[:4000]},
         ]
     }
 
-    # Try newer param first, then fallback for compatibility.
-    for token_param in ("max_completion_tokens", "max_tokens"):
-        payload = dict(base_payload)
-        payload[token_param] = 256
+    data = _http_post_json(url, headers, payload, timeout=30)
 
-        resp = requests.post(url, headers=headers, json=payload, timeout=30)
-        if resp.status_code == 200:
-            data = resp.json()
-            try:
-                return data["choices"][0]["message"]["content"].strip()
-            except Exception:
-                return str(data)
-
-        # If it's the "unsupported parameter" error, try the other param
-        if resp.status_code == 400 and "unsupported" in resp.text.lower():
-            continue
-
-        # Anything else: raise
-        raise RuntimeError(f"Azure OpenAI HTTP {resp.status_code}: {resp.text}")
-
-    raise RuntimeError("Azure OpenAI call failed for both token parameter styles.")
+    try:
+        return data["choices"][0]["message"]["content"].strip()
+    except Exception:
+        return str(data)
 
 
 @app.post("/api/chat")
 def chat(req: ChatRequest, x_api_key: Optional[str] = Header(default=None)):
-    # Enforce gateway auth
     _require_gateway_key(x_api_key)
 
     request_id = str(uuid.uuid4())
 
-    # Simple “bank-ish” safety: refuse obvious secret/bypass attempts
     lower = req.message.lower()
     if any(x in lower for x in ["api key", "client secret", "password", "token", "system prompt", "bypass"]):
         return {
